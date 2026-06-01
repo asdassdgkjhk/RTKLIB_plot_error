@@ -1,0 +1,13 @@
+build/
+input_data/
+output_data/
+*.exe
+*.pos
+*.pos.stat
+*.pos.trace
+*.txt
+*.txt.stat
+*.txt.trace
+*.png
+.vscode/
+CmakeLists.txt
