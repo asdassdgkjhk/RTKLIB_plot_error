@@ -29,7 +29,7 @@
                     "ignoreFailures": true // 忽略命令失败
                 }
             ],
-            "preLaunchTask": "C/C++: gcc.exe build active file" // 预启动task任务，编译程序
+            "preLaunchTask": "C/C++: gcc.exe 编译rtklib可执行程序" // 预启动task任务，编译程序
         }
     ]
 }
