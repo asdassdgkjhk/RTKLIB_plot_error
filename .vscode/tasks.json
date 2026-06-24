@@ -1,0 +1,39 @@
+// 用于编译
+{
+    "tasks": [
+        {
+            "type": "cppbuild",
+            "label": "C/C++: gcc.exe 编译rtklib可执行程序",
+            "command": "D:\\tool\\mingw_w64\\mingw64\\mingw64\\bin\\gcc.exe",
+            "args": [
+                "-fdiagnostics-color=always",
+                // 编译源文件
+                "D:/study/code/c_plus/RTKLIB/RTKLIB_2.4.3/src/*.c",
+                "D:/study/code/c_plus/RTKLIB/RTKLIB_2.4.3/src/rcv/*.c",
+                // 显示调试信息
+                "-g",
+                // 头文件路径
+                "-I",
+                "D:/study/code/c_plus/RTKLIB/RTKLIB_2.4.3/src",
+                "-lwinmm",
+                "-lws2_32",
+                "-DWIN_DLL",
+                // 生成可执行文件的路径和名称
+                "-o",
+                "${workspaceFolder}/build/rnx2rtkp.exe"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "调试器生成的任务。"
+        }
+    ],
+    "version": "2.0.0"
+}

@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "rtklib.h": "c",
+        "time.h": "c",
+        "pthread.h": "c"
+    },
+    "C_Cpp.errorSquiggles": "disabled"
+}
