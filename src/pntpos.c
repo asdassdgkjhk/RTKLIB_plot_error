@@ -30,6 +30,210 @@
 
 #define SQR(x) ((x) * (x))
 
+/* ---- SPP error terms dump ---------------------------------------------------
+ * 将每个历元、每颗参与 SPP 解算的有效卫星的各项误差校正项输出到 CSV 文件，
+ * 便于后续 Python 读取并绘图。
+ * 输出文件：spp_error_terms.csv（与 .pos 文件分开）
+ * ------------------------------------------------------------------------- */
+static double prange(const obsd_t *obs, const nav_t *nav, const prcopt_t *opt,
+                     double *var); /* 前置声明：prange 在文件后部定义 */
+static double gettgd(int sat, const nav_t *nav, int type); /* 前置声明 */
+
+static FILE *fp_spp_err_    = NULL;
+static int   spp_err_hdr_   = 0;   /* 表头是否已写入 */
+
+static char spp_sys_char_(int sys)
+{
+    switch (sys) {
+        case SYS_GPS: return 'G';
+        case SYS_GLO: return 'R';
+        case SYS_GAL: return 'E';
+        case SYS_CMP: return 'C';
+        case SYS_QZS: return 'J';
+        case SYS_IRN: return 'I';
+        case SYS_SBS: return 'S';
+        default:      return '?';
+    }
+}
+
+static FILE *spp_err_open_(void)
+{
+    if (!fp_spp_err_) {
+        fp_spp_err_ = fopen("spp_error_terms.csv", "w");
+        if (!fp_spp_err_) {
+            trace(1, "spp_err_open: cannot open spp_error_terms.csv\n");
+            return NULL;
+        }
+        /* CSV 表头
+         * 统一符号约定：观测值 = 几何距离 + 各误差项 (等号右边)
+         *   P_raw = rho + rcv_clk + sat_clk_corr + sat_rel_corr + tgd_corr
+         *           + iono_corr + trop_corr + v_residual
+         * 其中 P_raw = prange()返回值 P + tgd_corr (原始伪距，未扣 TGD)
+         *
+         * 仅 GPS 解算场景：只保存 GPS 接收机钟差 x[3]
+         *
+         * sat_clk_corr : 纯卫星钟差改正 (m)，已从 dts 中剔除相对论
+         *                = -CLIGHT*dts - 2*dot(r,v)/CLIGHT
+         * sat_rel_corr : 相对论效应改正 (m)
+         *                = +2*dot(r,v)/CLIGHT
+         * tgd_corr     : TGD/BGD 码偏差改正 (m)
+         *                = +tgd （与 prange() 内部扣除的 b1 同值同号）
+         * 三者相加：sat_clk_corr + sat_rel_corr + tgd_corr
+         *         = -CLIGHT*dts + tgd  （与 RTKLIB 残差公式一致）
+         *
+         * rcv_clk      : GPS 接收机钟差 (m) = x[3]
+         * v_residual   : 伪距残差 (m) = resp[i]
+         */
+        fprintf(fp_spp_err_,
+            "time,sat,sys,el_deg,az_deg,P,rho,"
+            "sat_clk_corr,sat_rel_corr,tgd_corr,"
+            "iono_corr,trop_corr,"
+            "rcv_clk,"
+            "v_residual,iter\n");
+        spp_err_hdr_ = 1;
+    }
+    return fp_spp_err_;
+}
+
+/* 获取当前观测对应的 TGD (m)，与 prange() 单频分支逻辑一致。
+ * 双频 IFLC 模式下 prange() 对 TGD 的处理不同，这里仍返回单频 TGD 供参考。
+ */
+static double get_sat_tgd_(const obsd_t *obs, const nav_t *nav)
+{
+    int sat = obs->sat;
+    int sys = satsys(sat, NULL);
+
+    if (sys == SYS_GPS || sys == SYS_QZS) {
+        return gettgd(sat, nav, 0);              /* TGD (m) */
+    }
+    if (sys == SYS_GLO) {
+        return gettgd(sat, nav, 0);              /* -dtaun*CLIGHT (m) */
+    }
+    if (sys == SYS_GAL) {
+        return getseleph(SYS_GAL) ? gettgd(sat, nav, 0)   /* BGD_E1E5a */
+                                  : gettgd(sat, nav, 1);  /* BGD_E1E5b */
+    }
+    if (sys == SYS_CMP) {
+        if (obs->code[0] == CODE_L2I) return gettgd(sat, nav, 0);             /* TGD_B1I */
+        if (obs->code[0] == CODE_L1P) return gettgd(sat, nav, 2);             /* TGD_B1Cp */
+        return gettgd(sat, nav, 2) + gettgd(sat, nav, 4);                     /* TGD_B1Cp+ISC_B1Cd */
+    }
+    if (sys == SYS_IRN) {
+        return gettgd(sat, nav, 0);              /* TGD (m) */
+    }
+    return 0.0;
+}
+
+/* 输出单历元所有有效卫星的误差项。
+ * 调用时机：pntpos()/my_pntpos() 中 estpos() 成功后，
+ *           使用最终解 x[] 重新计算各项改正量。
+ *
+ * 统一符号约定：观测值 = 几何距离 + 各误差项 (等号右边)
+ *   P_raw = rho + rcv_clk + sat_clk_corr + sat_rel_corr + tgd_corr
+ *           + iono_corr + trop_corr + v_residual
+ * 其中 P_raw = prange() 返回值 P + tgd_corr (原始伪距，未扣 TGD)
+ *
+ * 仅 GPS 解算场景：只保存 GPS 接收机钟差 x[3]
+ *
+ * sat_clk_corr = -CLIGHT*dts - 2*dot(r,v)/CLIGHT   纯钟差改正（剔除相对论）
+ * sat_rel_corr = +2*dot(r,v)/CLIGHT                相对论改正
+ * tgd_corr     = +tgd                              TGD/BGD 改正
+ * iono_corr    = +dion                             电离层延迟
+ * trop_corr    = +dtrp                             对流层延迟
+ * rcv_clk      = x[3]                              GPS 接收机钟差
+ * v_residual   = resp[i]                           伪距残差
+ */
+static void dump_spp_errors(const obsd_t *obs, int n, const double *rs,
+                            const double *dts, const nav_t *nav,
+                            const double *x, const prcopt_t *opt,
+                            const double *azel, const int *vsat,
+                            const double *resp, gtime_t sol_time, int iter)
+{
+    FILE *fp;
+    char  tstr[64], satid[16];
+    double rr[3], pos[3], e[3], r, P, dion, dtrp, vion, vtrp, vmeas, freq;
+    double dot_rv, sat_clk_m, sat_rel_m, tgd_m, rcv_clk;
+    int    i, sat, sys;
+
+    if (!(fp = spp_err_open_())) return;
+
+    for (i = 0; i < 3; i++) rr[i] = x[i];
+    ecef2pos(rr, pos);
+
+    /* GPS 接收机钟差 (m)
+     * 异常值保护：若 |x[3]| > 1e6 m 视为无效，输出 NaN */
+    rcv_clk = fabs(x[3]) < 1e6 ? x[3] : NAN;
+
+    time2str(sol_time, tstr, 3);      /* YYYY-MM-DD HH:MM:SS.sss */
+
+    for (i = 0; i < n && i < MAXOBS; i++) {
+        if (!vsat[i]) continue;       /* 只输出参与最终解算的有效卫星 */
+
+        sat = obs[i].sat;
+        if (!(sys = satsys(sat, NULL))) continue;
+        satno2id(sat, satid);         /* G10 / C06 / E11 ... */
+
+        /* 几何距离 + 视向单位向量 */
+        if ((r = geodist(rs + i * 6, rr, e)) <= 0.0) continue;
+
+        /* 电离层延迟（与 rescode 完全一致的算法） */
+        if (!ionocorr(obs[i].time, nav, sat, pos, azel + i * 2,
+                      opt->ionoopt, &dion, &vion)) continue;
+        if ((freq = sat2freq(sat, obs[i].code[0], nav)) == 0.0) continue;
+        dion *= SQR(FREQ1 / freq);    /* 缩放到当前频率 (m) */
+
+        /* 对流层延迟 */
+        if (!tropcorr(obs[i].time, nav, pos, azel + i * 2,
+                      opt->tropopt, &dtrp, &vtrp)) continue;
+
+        /* 伪距（已含码偏差改正） */
+        P = prange(obs + i, nav, opt, &vmeas);
+
+        /* IFLC 模式下电离层已消去，置 0 */
+        if (opt->ionoopt == IONOOPT_IFLC) dion = 0.0;
+
+        /* TGD (m)，与 prange() 单频分支一致 */
+        tgd_m = get_sat_tgd_(obs + i, nav);
+
+        /* 卫星位置·速度点积 */
+        dot_rv = dot(rs + i * 6, rs + 3 + i * 6, 3);
+
+        /* 纯卫星钟差改正 (m)，已剔除相对论
+         *   dts = 纯钟差(s) + 相对论(s)，相对论(s) = -2*dot(r,v)/CLIGHT^2
+         *   sat_clk_corr = -CLIGHT * 纯钟差
+         *                = -CLIGHT*dts - 2*dot(r,v)/CLIGHT */
+        sat_clk_m = -CLIGHT * dts[i * 2] - 2.0 * dot_rv / CLIGHT;
+
+        /* 相对论效应改正 (m)
+         *   sat_rel_corr = -CLIGHT * 相对论(s)
+         *                = +2*dot(r,v)/CLIGHT */
+        sat_rel_m = 2.0 * dot_rv / CLIGHT;
+
+        fprintf(fp,
+            "%s,%s,%c,%.3f,%.3f,%.4f,%.4f,"
+            "%.4f,%.4f,%.4f,"
+            "%.4f,%.4f,"
+            "%.4f,"
+            "%.4f,%d\n",
+            tstr,
+            satid,
+            spp_sys_char_(sys),
+            azel[1 + i * 2] * R2D,     /* elevation (deg) */
+            azel[i * 2]     * R2D,     /* azimuth (deg) */
+            P,
+            r,
+            sat_clk_m,                 /* 纯卫星钟差改正 */
+            sat_rel_m,                 /* 相对论改正 */
+            tgd_m,                     /* TGD 改正 */
+            dion,                      /* 电离层延迟 */
+            dtrp,                      /* 对流层延迟 */
+            rcv_clk,                   /* GPS 接收机钟差 */
+            resp[i],                   /* 伪距残差 */
+            iter);
+    }
+    fflush(fp);
+}
+
 #if 0              /* enable GPS-QZS time offset estimation */
 #define NX (4 + 5) /* # of estimated parameters */
 #else
@@ -784,6 +988,18 @@ extern int pntpos(const obsd_t *obs, int n, const nav_t *nav,
 
     // 根据vsat数组，从而取出rs中相应的坐标，卫星相应的连续的satellite number存储在obs当中
 
+    /* === 输出 SPP 误差项到 CSV（仅在解算成功时） === */
+    if (stat) {
+        /* 构造完整状态向量 x[]：位置取自 sol->rr，接收机钟差取自 sol->dtr[0]
+         * （estpos() 中 sol->rr[3..5] 被置 0，钟差存于 sol->dtr[0]，单位 s） */
+        double x_dump[NX] = {0};
+        for (i = 0; i < 3; i++) x_dump[i] = sol->rr[i];
+        x_dump[3] = sol->dtr[0] * CLIGHT;  /* 接收机钟差 (m) */
+        dump_spp_errors(obs, n, rs, dts, nav, x_dump, &opt_,
+                        azel_, vsat, resp, obs[0].time, 0);
+    }
+    /* === end === */
+
     /* RAIM FDE */
     if (!stat && n >= 6 && opt->posopt[4])
     {
@@ -885,6 +1101,18 @@ extern int my_pntpos(const obsd_t *obs, int n, const nav_t *nav,
 
     /* estimate receiver position with pseudorange */
     stat = estpos(obs, n, rs, dts, var, svh, nav, &opt_, sol, azel_, vsat, resp, msg);
+
+    /* === 输出 SPP 误差项到 CSV（仅在解算成功时） === */
+    if (stat) {
+        /* 构造完整状态向量 x[]：位置取自 sol->rr，接收机钟差取自 sol->dtr[0]
+         * （estpos() 中 sol->rr[3..5] 被置 0，钟差存于 sol->dtr[0]，单位 s） */
+        double x_dump[NX] = {0};
+        for (i = 0; i < 3; i++) x_dump[i] = sol->rr[i];
+        x_dump[3] = sol->dtr[0] * CLIGHT;  /* 接收机钟差 (m) */
+        dump_spp_errors(obs, n, rs, dts, nav, x_dump, &opt_,
+                        azel_, vsat, resp, obs[0].time, 0);
+    }
+    /* === end === */
 
     /* RAIM FDE */
     if (!stat && n >= 6 && opt->posopt[4])
